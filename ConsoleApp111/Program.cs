@@ -6,6 +6,7 @@ using Grpc.Auth;
 using Grpc.Core;
 using Google.Cloud.ResourceManager.V3;
 using Google.LongRunning;
+using Google.Protobuf.WellKnownTypes;
 
 try
 {
@@ -13,11 +14,12 @@ try
     string projectId = "rpa-pub-sub-services";
     string serviceAccountPath = "C:\\Users\\Mohd Danish\\Downloads\\rpa-pub-sub-services-84875417fab2.json";
     int maximumNoOfMessagesWhilePulling = 10;
+    int retentionDaysForTopic = 30;
 
     // we can ask from google pub sub
-    string topicId = "RPA-Testing-Topic-2";
-    string subscriptionId = "RPA-Testing-Subscription_Id_0";
-    //string subscriptionId2 = "RPA-Testing-Subscription_Id_2";
+    string topicId = "RPA-Testing-Attributes-Topic-with-retention-in-days-2";
+    string newSubscriptionId = "RPA-Testing-Attributes-subs-new-with-retention-in-days-2";
+    string oldSubscriptionId = "RPA-Testing-Attributes-subs-old-with-retention-in-days-2";
 
     GoogleCredential credential;
     using (var stream = new FileStream(serviceAccountPath, FileMode.Open, FileAccess.Read))
@@ -25,25 +27,26 @@ try
         credential = GoogleCredential.FromStream(stream)
             .CreateScoped("https://www.googleapis.com/auth/cloud-platform");
     }
-
     ChannelCredentials channelCredentials = credential.ToChannelCredentials();
 
-
-
     //create topic
-    await CreateTopicAsync(projectId, topicId, channelCredentials);
+    await CreateTopicAsync(projectId, topicId, channelCredentials, retentionDaysForTopic);
 
-    // Create a subscription to the topic
-    await CreateSubscriptionAsync(projectId, subscriptionId, topicId,  channelCredentials);
+    // Create Subscription
+    await CreateSubscriptionWithFilterAsync(projectId, topicId, newSubscriptionId, "attributes.status=\"new\"", channelCredentials);
+    await CreateSubscriptionWithFilterAsync(projectId, topicId, oldSubscriptionId, "attributes.status=\"old\"", channelCredentials);
 
-    // Publish a message to the topic
-    await PublishMessageAsync(projectId, topicId, "New topic new subscription Id ", channelCredentials);
+    // Publish messages with different attributes
+    await PublishMessageWithAttributesAsync(projectId, topicId, "New Message 1", new Dictionary<string, string> { { "status", "new" } }, channelCredentials);
+    await PublishMessageWithAttributesAsync(projectId, topicId, "Old Message 1", new Dictionary<string, string> { { "status", "old" } }, channelCredentials);
 
-    //Pull messages from the subscription
-    await PullMessagesAsync(projectId, subscriptionId, channelCredentials, maximumNoOfMessagesWhilePulling);
-    Console.WriteLine("After first call");
-    await PullMessagesAsync(projectId, subscriptionId, channelCredentials, maximumNoOfMessagesWhilePulling);
-    Console.WriteLine("After Second call");
+    // Pull messages from each subscription
+    Console.WriteLine("Pulling messages from new subscription:");
+    await PullMessagesAsync(projectId, newSubscriptionId, channelCredentials, maximumNoOfMessagesWhilePulling);
+
+    Console.WriteLine("Pulling messages from old subscription:");
+    await PullMessagesAsync(projectId, oldSubscriptionId, channelCredentials, maximumNoOfMessagesWhilePulling);
+
     Console.ReadLine();
 }
 
@@ -54,29 +57,8 @@ catch (Exception ex)
     Console.ReadLine();
 }
 
-static async Task CreateProjectAsync(string projectId, string projectName, GoogleCredential credential)
-{
-    ProjectName parent = new ProjectName("organizations/YOUR_ORGANIZATION_ID"); // Replace with your organization ID
-    ProjectsClient projectsClient = await ProjectsClient.CreateAsync();
-    Project project = new Project
-    {
-        ProjectId = projectId,
-        Name = projectName,
-        Parent = parent.ToString()
-    };
 
-    Operation<Project, CreateProjectMetadata> operation = await projectsClient.CreateProjectAsync(project);
-
-    // Wait for the operation to complete
-    Operation<Project, CreateProjectMetadata> completedOperation = await operation.PollUntilCompletedAsync();
-    Project createdProject = completedOperation.Result;
-
-    Console.WriteLine($"Project {createdProject.Name} created.");
-}
-
-
-
-static async Task CreateTopicAsync(string projectId, string topicId, ChannelCredentials credentials)
+static async Task CreateTopicAsync(string projectId, string topicId, ChannelCredentials credentials, int retentionDays)
 {
     TopicName topicName = TopicName.FromProjectTopic(projectId, topicId);
     PublisherServiceApiClient publisher = new PublisherServiceApiClientBuilder
@@ -84,18 +66,31 @@ static async Task CreateTopicAsync(string projectId, string topicId, ChannelCred
         ChannelCredentials = credentials
     }.Build();
 
+    TimeSpan messageRetentionDuration = TimeSpan.FromDays(retentionDays);
+
     try
     {
-        Topic topic = await publisher.CreateTopicAsync(topicName);
-        Console.WriteLine($"Topic {topic.Name} created.");
+        //Topic topic = await publisher.CreateTopicAsync(topicName);
+        //Console.WriteLine($"Topic {topic.Name} created.");
+        
+        Topic topic = new Topic
+        {
+            TopicName = topicName,
+            MessageRetentionDuration = Google.Protobuf.WellKnownTypes.Duration.FromTimeSpan(messageRetentionDuration)
+        };
+
+        Topic createdTopic = await publisher.CreateTopicAsync(topic);
+        Console.WriteLine($"Topic {createdTopic.Name} created with a retention period of {retentionDays} days.");
+        
     }
     catch (RpcException e) when (e.Status.StatusCode == StatusCode.AlreadyExists)
     {
         Console.WriteLine($"Topic {topicName} already exists.");
     }
 }
+    
 
-static async Task CreateSubscriptionAsync(string projectId, string subscriptionId, string topicId, ChannelCredentials credentials)
+static async Task CreateSubscriptionWithFilterAsync(string projectId, string topicId, string subscriptionId, string filter, ChannelCredentials credentials)
 {
     SubscriptionName subscriptionName = SubscriptionName.FromProjectSubscription(projectId, subscriptionId);
     TopicName topicName = TopicName.FromProjectTopic(projectId, topicId);
@@ -103,11 +98,18 @@ static async Task CreateSubscriptionAsync(string projectId, string subscriptionI
     {
         ChannelCredentials = credentials
     }.Build();
-
     try
     {
-        Subscription subscription = await subscriber.CreateSubscriptionAsync(subscriptionName, topicName, pushConfig: null, ackDeadlineSeconds: 60);
-        Console.WriteLine($"Subscription {subscription.Name} created.");
+        Subscription subscription = new Subscription
+        {
+            SubscriptionName = subscriptionName,
+            TopicAsTopicName = topicName,
+            Filter = filter,
+            AckDeadlineSeconds = 60
+
+        };
+        subscription = await subscriber.CreateSubscriptionAsync(subscription);
+        Console.WriteLine($"Subscription {subscription.Name} created with filter: {filter}");
     }
     catch (RpcException e) when (e.Status.StatusCode == StatusCode.AlreadyExists)
     {
@@ -115,24 +117,27 @@ static async Task CreateSubscriptionAsync(string projectId, string subscriptionI
     }
 }
 
-static async Task PublishMessageAsync(string projectId, string topicId, string message, ChannelCredentials credentials)
+static async Task PublishMessageWithAttributesAsync(string projectId, string topicId, string message, IDictionary<string, string> attributes, ChannelCredentials credentials)
 {
     TopicName topicName = TopicName.FromProjectTopic(projectId, topicId);
     PublisherClient publisher = await PublisherClient.CreateAsync(topicName, new PublisherClient.ClientCreationSettings(credentials: credentials));
 
     try
     {
-        for (int i = 0;i< 45;i++) {
-            string messageId = await publisher.PublishAsync(message + i);
-            Console.WriteLine($"Published message ID: {messageId}");
-        }   
+        PubsubMessage pubsubMessage = new PubsubMessage
+        {
+            Data = Google.Protobuf.ByteString.CopyFromUtf8(message),
+            Attributes = { attributes }
+        };
+
+        string messageId = await publisher.PublishAsync(pubsubMessage);
+        Console.WriteLine($"Published message ID: {messageId} with attributes: {string.Join(", ", attributes)}");
     }
     catch (Exception e)
     {
         Console.WriteLine($"Error publishing message: {e.Message}");
     }
 }
-
 
 static async Task PullMessagesAsync(string projectId, string subscriptionId, ChannelCredentials credentials, int maximumNoOfMessagesWhilePulling)
 {
@@ -145,10 +150,20 @@ static async Task PullMessagesAsync(string projectId, string subscriptionId, Cha
     try
     {
         PullResponse response = await subscriber.PullAsync(subscriptionName, returnImmediately: false, maxMessages: maximumNoOfMessagesWhilePulling);
-        foreach (ReceivedMessage message in response.ReceivedMessages)
+        foreach (ReceivedMessage receivedMessage in response.ReceivedMessages)
         {
-            Console.WriteLine($"Received message: {message.Message.Data.ToStringUtf8()}");
-            await subscriber.AcknowledgeAsync(subscriptionName, new List<string> { message.AckId });
+            PubsubMessage message = receivedMessage.Message;
+            string messageData = message.Data.ToStringUtf8();
+            var attributes = message.Attributes;
+
+            Console.WriteLine($"Received message: {messageData}");
+            foreach (var attribute in attributes)
+            {
+                Console.WriteLine($"Attribute - {attribute.Key}: {attribute.Value}");
+            }
+
+            // Acknowledge the message
+            await subscriber.AcknowledgeAsync(subscriptionName, new List<string> { receivedMessage.AckId });
         }
     }
     catch (RpcException e)
@@ -156,7 +171,6 @@ static async Task PullMessagesAsync(string projectId, string subscriptionId, Cha
         Console.WriteLine($"Error pulling messages: {e.Message}");
     }
 }
-
 
 
 
